@@ -1,0 +1,724 @@
+/******************************************************
+ * CRYPTO QUANTUM TRADER PRO — v16.4s (Sheets • FULL • safe)
+ * TZ: Europe/Moscow
+ * Proxy: Cloudflare Worker (/health, /pack, /mux)
+ * Anti-Quota: throttled /pack + cached books/trades/funding/oi/ohlc
+ ******************************************************/
+
+/* ===================== GLOBAL CONFIG ===================== */
+const TZ = 'Europe/Moscow';
+const WORKER_BASE = 'https://pikhta.pikhtovnikov-alieksandr.workers.dev'; // <-- твой воркер
+const WORKER_KEY  = 'MySuperSecretKey123!@#'; // <-- SECRET_KEY из Cloudflare
+const DEFAULT_SYMBOLS = ['BTC','ETH','SOL','XRP','ADA'];
+
+/* Anti-quota for /pack (без разделителей разрядов!) */
+const PACK_RATE_LIMIT_MS = 60000;  // было 60_000
+const PACK_CACHE_TTL_SEC = 55;
+
+/* Cached TTLs for other endpoints */
+const BOOK_TTL_SEC    = 60;
+const TRADES_TTL_SEC  = 60;
+const FUND_TTL_SEC    = 300;
+const OI_TTL_SEC      = 120;
+const OHLC_TTL_SEC    = 60;
+
+/* Analytics params */
+const BOOK_LEVELS     = 20;
+const ATR_PERIOD_M1   = 14;
+const ATR_MIN_RATIO   = 0.005;
+const WALL_REL_MULT   = 3.0;
+const WALL_BUF_RATIO  = 0.0015;
+
+const TAKER_FEE_PER_SIDE = 0.0006;
+const SLIPPAGE_BPS_BASE  = 5;
+
+/* Model defaults */
+const LONG_PROB_MIN  = 0.55;
+const SHORT_PROB_MAX = 0.45;
+const LR             = 0.03;
+const L2             = 0.001;
+
+/* Risk & horizons */
+const ACCOUNT_SIZE_USD     = 10000;   // было 10_000
+const RISK_PER_TRADE_PCT   = 1.0;
+const DAILY_RISK_LIMIT_USD = 200;
+const TTL_SCALP_MIN        = 60;
+const TTL_SWING_MIN        = 360;     // 6*60
+const TTL_POSITION_MIN     = 1440;    // 24*60
+
+/* EventGuard */
+const EVENT_RISK_MULT   = 0.5;
+const EVENT_SL_MULT     = 1.2;
+const BLOCK_SCALP_IN_EVENT = true;
+
+/* TP map (в R) и доли */
+const TP_R = [1.0, 1.8, 3.0, 4.5];
+const TP_ALLOCATION = [0.25, 0.25, 0.25, 0.25];
+
+/* ======================= UTILITIES ======================= */
+const U = {
+  ss: () => SpreadsheetApp.getActive(),
+  nowStr(){ return Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd HH:mm:ss'); },
+  parseIso(s){ return s ? new Date(s) : null; },
+  diffMin(a,b){ return Math.floor((a-b)/60000); },
+  getOrCreate(name, headers){
+    const ss = this.ss();
+    let sh = ss.getSheetByName(name);
+    if(!sh) sh = ss.insertSheet(name);
+    if(headers && headers.length){
+      const have = sh.getRange(1,1,1,headers.length).getDisplayValues()[0];
+      const need = have.join('') === '' || have.length < headers.length || String(have[0]).trim() !== String(headers[0]).trim();
+      if(need){
+        sh.clear();
+        sh.getRange(1,1,1,headers.length).setValues([headers]);
+        sh.setFrozenRows(1);
+      }
+    }
+    return sh;
+  },
+  setMenu(){
+    SpreadsheetApp.getUi().createMenu('🚀 Quantum Trader')
+      .addItem('📡 Тест соединения','testConnectivity')
+      .addItem('🔄 Обновить (main)','updateMain')
+      .addSeparator()
+      .addItem('⚙️ Инициализация','initQuantumTrader')
+      .addItem('⏱️ Установить триггеры','installTriggers')
+      .addItem('📊 KPI (24h)','kpi_24h_summary_now')
+      .addToUi();
+  },
+  props(){ return PropertiesService.getScriptProperties(); },
+  cache(){ return CacheService.getScriptCache(); },
+  readJsonSafe(s){ try{ return JSON.parse(s); }catch(e){ return null; } },
+  clamp(x,a,b){ return Math.max(a, Math.min(b,x)); },
+  sigmoid(z){ return 1/(1+Math.exp(-z)); },
+  zScore(x, mean, std){ return std>0? (x-mean)/std : 0; },
+  sum(a){ return a.reduce((s,x)=>s+(+x||0),0); },
+  mean(a){ return a.length? U.sum(a)/a.length : 0; },
+  std(a){
+    if(a.length<2) return 0;
+    const m=U.mean(a); const v=U.mean(a.map(x=>(x-m)*(x-m)));
+    return Math.sqrt(v);
+  },
+  corr(a,b){
+    const n=Math.min(a.length,b.length); if(n<3) return 0;
+    const x=a.slice(-n), y=b.slice(-n);
+    const mx=U.mean(x), my=U.mean(y);
+    let num=0, dx=0, dy=0;
+    for(let i=0;i<n;i++){ const vx=x[i]-mx, vy=y[i]-my; num+=vx*vy; dx+=vx*vx; dy+=vy*vy; }
+    return (dx>0 && dy>0)? (num/Math.sqrt(dx*dy)) : 0;
+  },
+  id(sym){ return 'QTP-'+Date.now()+'-'+sym; },
+  toFixedDyn(p){
+    if (!isFinite(p)) return '';
+    if (p >= 1000) return p.toFixed(1);
+    if (p >= 100)  return p.toFixed(2);
+    if (p >= 1)    return p.toFixed(3);
+    return p.toFixed(5);
+  }
+};
+
+/* =================== SETTINGS SHEET =================== */
+function ensureSettings(){
+  const sh = U.getOrCreate('⚙️ НАСТРОЙКИ', ['Ключ','Значение','Комментарий']);
+  const defaults = [
+    ['TZ', TZ, 'Таймзона логов'],
+    ['WORKER_BASE', WORKER_BASE, 'URL Cloudflare Worker'],
+    ['SYMBOLS', DEFAULT_SYMBOLS.join(','), 'Символы через запятую'],
+    ['PACK_RATE_LIMIT_MS', PACK_RATE_LIMIT_MS, '1 запрос к /pack не чаще, мс'],
+    ['BOOK_LEVELS', BOOK_LEVELS, 'Глубина книги'],
+    ['ATR_PERIOD_M1', ATR_PERIOD_M1, 'ATR период (1м)'],
+    ['ATR_MIN_RATIO', ATR_MIN_RATIO, 'Мин SL как % цены'],
+    ['WALL_REL_MULT', WALL_REL_MULT, 'Аномальная стена: x средн.'],
+    ['WALL_BUF_RATIO', WALL_BUF_RATIO, 'Буфер за стеной для SL/TP'],
+    ['LONG_PROB_MIN', LONG_PROB_MIN, 'Порог LONG'],
+    ['SHORT_PROB_MAX', SHORT_PROB_MAX, 'Порог SHORT'],
+    ['ACCOUNT_SIZE_USD', ACCOUNT_SIZE_USD, 'Баланс (USD)'],
+    ['RISK_PER_TRADE_PCT', RISK_PER_TRADE_PCT, '% риска/сделку'],
+    ['DAILY_RISK_LIMIT_USD', DAILY_RISK_LIMIT_USD, 'Дневной риск (soft)'],
+    ['TTL_SCALP_MIN', TTL_SCALP_MIN, 'TTL SCALP (мин)'],
+    ['TTL_SWING_MIN', TTL_SWING_MIN, 'TTL SWING (мин)'],
+    ['TTL_POSITION_MIN', TTL_POSITION_MIN, 'TTL POSITION (мин)'],
+    ['LR', LR, 'Логистическая модель: LR'],
+    ['L2', L2, 'Логистическая модель: L2'],
+    ['EVENT_RISK_MULT', EVENT_RISK_MULT, 'Риск-множитель на событиях'],
+    ['EVENT_SL_MULT', EVENT_SL_MULT, 'SL-множитель на событиях'],
+    ['BLOCK_SCALP_IN_EVENT', BLOCK_SCALP_IN_EVENT, 'true/false'],
+    ['USE_BOOK', true, 'Исп. книгу заявок'],
+    ['USE_TRADES', true, 'Исп. трейды (CVD)'],
+    ['USE_OI_FUND', true, 'Исп. OI/Funding'],
+    ['USE_OHLC', true, 'Исп. свечи для ATR']
+  ];
+  if(sh.getLastRow()<defaults.length+1){
+    sh.getRange(2,1,defaults.length,3).setValues(defaults);
+    sh.autoResizeColumns(1,3);
+  }
+  return sh;
+}
+function readSettingMap(){
+  const sh = ensureSettings();
+  const n = sh.getLastRow()-1;
+  const rows = n>0? sh.getRange(2,1,n,2).getValues() : [];
+  const m = {};
+  rows.forEach(function(rv){ var k=String(rv[0]).trim(); m[k] = (typeof rv[1]==='string'? rv[1].trim() : rv[1]); });
+  return m;
+}
+function getSymbolsList(){
+  const m = readSettingMap();
+  const s = m['SYMBOLS'] || DEFAULT_SYMBOLS.join(',');
+  return s.split(',').map(function(x){ return x.trim().toUpperCase(); }).filter(function(v){ return v; });
+}
+
+/* =================== WORKER CLIENT =================== */
+class WorkerClient{
+  static _headers(){ return { 'Accept':'application/json', 'User-Agent':'AppsScript-QuantumTrader', 'x-api-key': WORKER_KEY }; }
+  static getHealth(){
+    const url = (readSettingMap()['WORKER_BASE'] || WORKER_BASE) + '/health';
+    const r = UrlFetchApp.fetch(url, { muteHttpExceptions:true, followRedirects:true, headers:this._headers() });
+    if(r.getResponseCode()!==200) throw new Error('health status '+r.getResponseCode()+' '+r.getContentText());
+    return JSON.parse(r.getContentText());
+  }
+  static getPack(symbols){
+    const base = (readSettingMap()['WORKER_BASE'] || WORKER_BASE);
+    const qs = 'symbols=' + encodeURIComponent(symbols.join(','));
+    const url = base + '/pack?' + qs;
+    const r = UrlFetchApp.fetch(url, { muteHttpExceptions:true, followRedirects:true, headers:this._headers() });
+    if(r.getResponseCode()!==200) throw new Error('pack status '+r.getResponseCode()+' '+r.getContentText());
+    return JSON.parse(r.getContentText()); // { ok:true, data: {SYM:{...}} }
+  }
+}
+
+/* ====== Throttled /pack (anti-quota) ====== */
+function _throttledPack(symbols){
+  const cache = U.cache(), props = U.props();
+  const key = 'PACK_LAST_JSON'; const tKey = 'PACK_LAST_TS'; const lockKey = 'PACK_LOCK';
+  const cached = cache.get(key); const cachedTs = Number(props.getProperty(tKey) || '0');
+  const now = Date.now();
+  var rl = Number(readSettingMap()['PACK_RATE_LIMIT_MS'] || PACK_RATE_LIMIT_MS);
+
+  if (cached && (now - cachedTs) < rl) {
+    const obj = U.readJsonSafe(cached); if (obj && obj.ok) return Object.assign({}, obj, {_source:'LIVE'});
+  }
+  if(!props.getProperty(lockKey)){
+    try{
+      props.setProperty(lockKey, String(now));
+      const resp = WorkerClient.getPack(symbols);
+      cache.put(key, JSON.stringify(resp), PACK_CACHE_TTL_SEC);
+      props.setProperty(tKey, String(now));
+      props.deleteProperty(lockKey);
+      return Object.assign({}, resp, {_source:'LIVE'});
+    }catch(e){
+      props.deleteProperty(lockKey);
+      if(cached){ const obj = U.readJsonSafe(cached); if(obj && obj.ok) return Object.assign({}, obj, {_source:'STALE', _error:String(e && e.message || e)}); }
+      throw e;
+    }
+  }else{
+    if(cached){ const obj = U.readJsonSafe(cached); if(obj && obj.ok) return Object.assign({}, obj, {_source: (now-cachedTs)<rl? 'LIVE':'STALE'}); }
+    const resp2 = WorkerClient.getPack(symbols);
+    cache.put(key, JSON.stringify(resp2), PACK_CACHE_TTL_SEC);
+    props.setProperty(tKey, String(now));
+    return Object.assign({}, resp2, {_source:'LIVE'});
+  }
+}
+
+/* ====== Generic cached fetch (books/trades/funding/oi/ohlc) ====== */
+function _cachedJson(key, ttlSec, rateMs, urlBuildFn){
+  const cache = U.cache(), props = U.props();
+  const dataKey = 'C_'+key, tsKey = 'T_'+key, lockKey='L_'+key;
+  const cached = cache.get(dataKey); const lastTs = Number(props.getProperty(tsKey)||'0'); const now=Date.now();
+
+  if(cached && (now-lastTs) < rateMs){ const obj=U.readJsonSafe(cached); if(obj) return obj; }
+  if(!props.getProperty(lockKey)){
+    try{
+      props.setProperty(lockKey, String(now));
+      const uo = urlBuildFn();
+      const url = uo.url; const headers = uo.headers || {};
+      const r = UrlFetchApp.fetch(url, { muteHttpExceptions:true, followRedirects:true, headers: headers });
+      if(r.getResponseCode()!==200) throw new Error('status '+r.getResponseCode());
+      const obj = JSON.parse(r.getContentText());
+      cache.put(dataKey, JSON.stringify(obj), ttlSec);
+      props.setProperty(tsKey, String(now));
+      props.deleteProperty(lockKey);
+      return obj;
+    }catch(e){
+      props.deleteProperty(lockKey);
+      if(cached){ const obj=U.readJsonSafe(cached); if(obj) return obj; }
+      throw e;
+    }
+  }else{
+    if(cached){ const obj=U.readJsonSafe(cached); if(obj) return obj; }
+    const uo2 = urlBuildFn();
+    const r2 = UrlFetchApp.fetch(uo2.url, { muteHttpExceptions:true, followRedirects:true, headers: (uo2.headers||{}) });
+    if(r2.getResponseCode()!==200) throw new Error('status '+r2.getResponseCode());
+    const obj2 = JSON.parse(r2.getContentText());
+    cache.put(dataKey, JSON.stringify(obj2), ttlSec);
+    props.setProperty(tsKey, String(now));
+    return obj2;
+  }
+}
+
+/* =============== DataManager & analytics sources =============== */
+class DataManager{
+  constructor(){ this._lastPack=null; this._lastAt=0; }
+  _ensurePack(symList){
+    const pack = _throttledPack(symList);
+    this._lastPack = pack; this._lastAt = Date.now();
+  }
+  snapshot(sym){
+    const s = String(sym).toUpperCase();
+    const all = getSymbolsList();
+    if(!this._lastPack || (Date.now()-this._lastAt)>5000) this._ensurePack(all);
+    const row = this._lastPack && this._lastPack.data ? this._lastPack.data[s] : null;
+    if(row && isFinite(row.price)){
+      return { symbol:s, price:+row.price, src: row.source||'N/A', ts: row.timestampMskIso||row.timestampUtc, freshness:(this._lastPack._source||'LIVE') };
+    }
+    return null;
+  }
+  okxBook(sym){
+    const inst = sym+'-USDT-SWAP';
+    const key  = 'OKX_BOOK_'+sym;
+    return _cachedJson(key, BOOK_TTL_SEC, 55000, function(){ return {
+      url: 'https://www.okx.com/api/v5/market/books?instId='+encodeURIComponent(inst)+'&sz='+BOOK_LEVELS,
+      headers: { 'Accept':'application/json' }
+    };});
+  }
+  binanceBook(sym){
+    const key='BN_BOOK_'+sym;
+    const limit=Math.min(100, Math.max(20, BOOK_LEVELS));
+    return _cachedJson(key, BOOK_TTL_SEC, 55000, function(){ return {
+      url: 'https://fapi.binance.com/fapi/v1/depth?symbol='+encodeURIComponent(sym+'USDT')+'&limit='+limit,
+      headers: { 'Accept':'application/json' }
+    };});
+  }
+  okxTrades(sym, limit){
+    const inst=sym+'-USDT-SWAP';
+    const key='OKX_TR_'+sym;
+    const lim = Math.min(120, (limit||120));
+    return _cachedJson(key, TRADES_TTL_SEC, 55000, function(){ return {
+      url: 'https://www.okx.com/api/v5/market/trades?instId='+encodeURIComponent(inst)+'&limit='+lim,
+      headers: { 'Accept':'application/json' }
+    };});
+  }
+  binanceTrades(sym, limit){
+    const key='BN_TR_'+sym;
+    const lim = Math.min(1000, (limit||200));
+    return _cachedJson(key, TRADES_TTL_SEC, 55000, function(){ return {
+      url: 'https://fapi.binance.com/fapi/v1/trades?symbol='+encodeURIComponent(sym+'USDT')+'&limit='+lim,
+      headers: { 'Accept':'application/json' }
+    };});
+  }
+  funding(sym){
+    const inst=sym+'-USDT-SWAP';
+    const key='OKX_FUND_'+sym;
+    return _cachedJson(key, FUND_TTL_SEC, 240000, function(){ return {
+      url: 'https://www.okx.com/api/v5/public/funding-rate?instId='+encodeURIComponent(inst),
+      headers: { 'Accept':'application/json' }
+    };});
+  }
+  openInterest(sym){
+    const inst=sym+'-USDT-SWAP';
+    const key='OKX_OI_'+sym;
+    return _cachedJson(key, OI_TTL_SEC, 90000, function(){ return {
+      url: 'https://www.okx.com/api/v5/public/open-interest?instId='+encodeURIComponent(inst),
+      headers: { 'Accept':'application/json' }
+    };});
+  }
+  ohlc1m(sym, limit){
+    const inst=sym+'-USDT-SWAP';
+    const key='OKX_OHLC_'+sym;
+    const lim=Math.min(500, Math.max(100, (limit||300)));
+    return _cachedJson(key, OHLC_TTL_SEC, 55000, function(){ return {
+      url: 'https://www.okx.com/api/v5/market/candles?instId='+encodeURIComponent(inst)+'&bar=1m&limit='+lim,
+      headers: { 'Accept':'application/json' }
+    };});
+  }
+}
+var dataManager = new DataManager();
+
+/* ======================= Analytics ======================= */
+const Analytics = {
+  bookCombined: function(sym){
+    const use = String(readSettingMap()['USE_BOOK']||'true')==='true';
+    if(!use) return null;
+    var asks=[], bids=[], srcs=[];
+    try{
+      const ok = dataManager.okxBook(sym);
+      if(ok && ok.data && ok.data[0]){
+        const d=ok.data[0];
+        asks=asks.concat((d.asks||[]).map(function(a){return [+a[0],+a[1]];}).slice(0,BOOK_LEVELS));
+        bids=bids.concat((d.bids||[]).map(function(b){return [+b[0],+b[1]];}).slice(0,BOOK_LEVELS));
+        srcs.push('OKX');
+      }
+    }catch(e){}
+    try{
+      const bn = dataManager.binanceBook(sym);
+      if(bn){
+        asks=asks.concat((bn.asks||[]).map(function(a){return [+a[0],+a[1]];}).slice(0,BOOK_LEVELS));
+        bids=bids.concat((bn.bids||[]).map(function(b){return [+b[0],+b[1]];}).slice(0,BOOK_LEVELS));
+        srcs.push('BINANCE');
+      }
+    }catch(e){}
+    if(!asks.length && !bids.length) return null;
+    asks.sort(function(a,b){return a[0]-b[0];});
+    bids.sort(function(a,b){return b[0]-a[0];});
+    return {src:srcs.join('|')||'N/A', asks:asks, bids:bids};
+  },
+  wallsAndObi: function(sym, mid){
+    const book = Analytics.bookCombined(sym);
+    if(!book) return { OBI:0, floor:null, ceil:null, src:'N/A' };
+    const asks=book.asks.slice(0,BOOK_LEVELS), bids=book.bids.slice(0,BOOK_LEVELS);
+    const askVol=U.sum(asks.map(function(a){return a[1];})), bidVol=U.sum(bids.map(function(b){return b[1];}));
+    const OBI = (bidVol-askVol)/Math.max(1e-9, (bidVol+askVol));
+
+    const avgAsk = asks.length? U.mean(asks.map(function(a){return a[1];})) : 0;
+    const avgBid = bids.length? U.mean(bids.map(function(b){return b[1];})) : 0;
+    const askThr = avgAsk * WALL_REL_MULT;
+    const bidThr = avgBid * WALL_REL_MULT;
+
+    var ceil=null, floor=null;
+    for(var i=0;i<asks.length;i++){ var p=asks[i][0], sz=asks[i][1]; if(sz>=askThr && p>mid){ ceil = p; break; } }
+    for(var j=0;j<bids.length;j++){ var pb=bids[j][0], szb=bids[j][1]; if(szb>=bidThr && pb<mid){ floor = pb; break; } }
+    return { OBI:OBI, floor:floor, ceil:ceil, src:book.src };
+  },
+  cvd: function(sym){
+    const use = String(readSettingMap()['USE_TRADES']||'true')==='true';
+    if(!use) return 0;
+    try{
+      const ok = dataManager.okxTrades(sym, 120);
+      if(ok && ok.data){
+        var s=0;
+        for(var i=0;i<ok.data.length;i++){
+          const t=ok.data[i];
+          const sz=+t.sz; const side=String(t.side||'').toLowerCase();
+          if(!isFinite(sz)) continue;
+          s += (side==='buy'? +sz : (side==='sell'? -sz : 0));
+        }
+        return s;
+      }
+    }catch(e){}
+    try{
+      const bn = dataManager.binanceTrades(sym, 200);
+      if(Array.isArray(bn)){
+        var s2=0;
+        for(var k=0;k<bn.length;k++){
+          const t2=bn[k]; const qty=+t2.qty; const isBuyerMaker=!!t2.isBuyerMaker;
+          s2 += (isBuyerMaker? -qty : +qty);
+        }
+        return s2;
+      }
+    }catch(e){}
+    return 0;
+  },
+  funding: function(sym){
+    const use = String(readSettingMap()['USE_OI_FUND']||'true')==='true';
+    if(!use) return 0;
+    try{
+      const r = dataManager.funding(sym);
+      if(r && r.data && r.data[0]) return +r.data[0].fundingRate || 0;
+    }catch(e){}
+    return 0;
+  },
+  openInterest: function(sym){
+    const use = String(readSettingMap()['USE_OI_FUND']||'true')==='true';
+    if(!use) return { oi:0, delta:0 };
+    const props = U.props(); const key = 'OI_LAST_'+sym;
+    try{
+      const r = dataManager.openInterest(sym);
+      if(r && r.data && r.data[0]){
+        const oi = +r.data[0].oi || 0;
+        const prev = +(props.getProperty(key) || '0');
+        props.setProperty(key, String(oi));
+        return { oi:oi, delta: oi - prev };
+      }
+    }catch(e){}
+    return { oi:0, delta:0 };
+  },
+  atr: function(sym){
+    const use = String(readSettingMap()['USE_OHLC']||'true')==='true';
+    if(!use) return 0;
+    try{
+      const r = dataManager.ohlc1m(sym, Math.max(ATR_PERIOD_M1+5, 60));
+      if(r && r.data){
+        const rows = r.data.map(function(a){return {o:+a[1], h:+a[2], l:+a[3], c:+a[4]};}).reverse();
+        if(rows.length<ATR_PERIOD_M1+1) return 0;
+        const tr=[];
+        for(var i=1;i<rows.length;i++){
+          const hi=rows[i].h, lo=rows[i].l, pc=rows[i-1].c;
+          tr.push(Math.max(hi-lo, Math.abs(hi-pc), Math.abs(lo-pc)));
+        }
+        const n=ATR_PERIOD_M1;
+        const atr = tr.slice(-n).reduce(function(s,x){return s+x;},0)/n;
+        return atr;
+      }
+    }catch(e){}
+    return 0;
+  },
+  horizonByProj: function(px, floor, ceil){
+    const up = isFinite(ceil)? (ceil - px) : Infinity;
+    const dn = isFinite(floor)? (px - floor) : Infinity;
+    const dist = Math.min(up, dn);
+    const pct = dist/px;
+    if(pct <= 0.004) return 'SCALP';
+    if(pct <= 0.02)  return 'SWING';
+    return 'POSITION';
+  },
+  btcAdj: function(sym){
+    if(sym==='BTC') return 0;
+    const sh = U.getOrCreate('📈 ДЕРИВАТИВЫ', ['Время (MSK)','Символ','Цена','Источник','UTC','MSK ISO','Freshness']);
+    const rng = sh.getDataRange().getValues();
+    const rows = rng.slice(1).filter(function(r){return r[1] && r[2];});
+    const takeN=200;
+    const pxBySym = {};
+    for(var i=Math.max(0, rows.length-takeN); i<rows.length; i++){
+      const r=rows[i], s=String(r[1]), p=+r[2];
+      if(!isFinite(p)) continue;
+      if(!pxBySym[s]) pxBySym[s]=[];
+      pxBySym[s].push(p);
+    }
+    const sArr = pxBySym[sym]||[];
+    const bArr = pxBySym['BTC']||[];
+    const n = Math.min(sArr.length, bArr.length);
+    if(n<30) return 0;
+    function logret(a){ const out=[]; for(var i2=1;i2<a.length;i2++){ if(a[i2-1]>0) out.push(Math.log(a[i2]/a[i2-1])); } return out; }
+    const rS = logret(sArr).slice(-100);
+    const rB = logret(bArr).slice(-100);
+    const corr = U.corr(rS, rB);
+    var adj = corr*0.12;
+    if(adj>0.12) adj=0.12; if(adj<-0.12) adj=-0.12;
+    return adj;
+  }
+};
+
+/* ==================== Model (logistic) ==================== */
+function ensureModelSheet(){
+  const sh = U.getOrCreate('🧠 МОДЕЛЬ', ['Feature','Weight']);
+  const defaults = [
+    ['bias',  -0.10],
+    ['OBI',    0.80],
+    ['Funding',-0.50],
+    ['dOI',    0.35],
+    ['CVD',    0.20],
+    ['Proj',   0.60],
+    ['H_SCALP', 0.10],
+    ['H_SWING', 0.05],
+    ['H_POSITION', -0.05],
+    ['BTCadj', 0.50]
+  ];
+  if(sh.getLastRow()<defaults.length+1){
+    sh.getRange(2,1,defaults.length,2).setValues(defaults);
+  }
+  return sh;
+}
+function readWeights(){
+  const sh = ensureModelSheet();
+  const n=sh.getLastRow()-1; const rows = n>0? sh.getRange(2,1,n,2).getValues() : [];
+  const w={}; rows.forEach(function(rv){ w[String(rv[0])] = +rv[1]; });
+  return w;
+}
+function writeWeights(w){
+  const sh=ensureModelSheet(); const n=sh.getLastRow()-1; const rows=sh.getRange(2,1,n,1).getValues();
+  const out=[]; for(var i=0;i<rows.length;i++){ const k=String(rows[i][0]); out.push([ isFinite(w[k])? w[k] : 0 ]); }
+  sh.getRange(2,2,out.length,1).setValues(out);
+}
+function modelScore(features, horizonTag){
+  const w=readWeights();
+  const z =
+    (w.bias||0) +
+    (w.OBI||0)*features.OBI +
+    (w.Funding||0)*features.funding +
+    (w.dOI||0)*features.dOI +
+    (w.CVD||0)*features.cvd +
+    (w.Proj||0)*features.proj +
+    (w.BTCadj||0)*features.btcAdj +
+    (horizonTag==='SCALP'   ? (w.H_SCALP||0)   : 0) +
+    (horizonTag==='SWING'   ? (w.H_SWING||0)   : 0) +
+    (horizonTag==='POSITION'? (w.H_POSITION||0): 0);
+  return U.sigmoid(z);
+}
+function modelOnlineUpdate(example){
+  const w=readWeights();
+  const lr=+readSettingMap()['LR']||LR;
+  const l2=+readSettingMap()['L2']||L2;
+  const y = example.label;
+  const p = example.prob;
+  const y01 = (y+1)/2;
+  const g = (p - y01);
+  function upd(k, xk){ w[k] = (w[k]||0) - lr * ( g * xk + l2*(w[k]||0) ); }
+  upd('bias', 1);
+  upd('OBI', example.feats.OBI||0);
+  upd('Funding', example.feats.funding||0);
+  upd('dOI', example.feats.dOI||0);
+  upd('CVD', example.feats.cvd||0);
+  upd('Proj', example.feats.proj||0);
+  upd('BTCadj', example.feats.btcAdj||0);
+  upd('H_SCALP',   example.horizon==='SCALP'?1:0);
+  upd('H_SWING',   example.horizon==='SWING'?1:0);
+  upd('H_POSITION',example.horizon==='POSITION'?1:0);
+  writeWeights(w);
+}
+
+/* =================== EventGuard / RiskGuard =================== */
+function ensureEventsSheet(){
+  return U.getOrCreate('🗞️ СОБЫТИЯ', ['Start (YYYY-MM-DD HH:mm:ss)','End (YYYY-MM-DD HH:mm:ss)','RiskMult','SLmult','BlockScalp(true/false)','Комментарий']);
+}
+function currentEventPolicy(){
+  const sh=ensureEventsSheet();
+  const rows = sh.getDataRange().getValues().slice(1);
+  const now = new Date();
+  var policy = {
+    riskMult: +readSettingMap()['EVENT_RISK_MULT'] || EVENT_RISK_MULT,
+    slMult:   +readSettingMap()['EVENT_SL_MULT']  || EVENT_SL_MULT,
+    blockScalp: String(readSettingMap()['BLOCK_SCALP_IN_EVENT']||BLOCK_SCALP_IN_EVENT)==='true',
+    active: false
+  };
+  for(var i=0;i<rows.length;i++){
+    const r=rows[i]; const st=U.parseIso(r[0]); const en=U.parseIso(r[1]);
+    const rm=+r[2]||policy.riskMult, sm=+r[3]||policy.slMult, bs=(String(r[4]).toLowerCase()==='true');
+    if(st && en && now>=st && now<=en){ policy = { riskMult:rm, slMult:sm, blockScalp:bs, active:true }; break; }
+  }
+  return policy;
+}
+function dailyRiskUsedUSD(){
+  const sh = U.getOrCreate('📦 АРХИВ СИГНАЛОВ', ['ID','Символ','Сторона','Entry','ExitAvg','Δ%','R','Итог','Длительность (мин)','Открыто (MSK)','Закрыто (MSK)','Комментарий']);
+  const today = Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd');
+  const rows = sh.getDataRange().getValues().slice(1);
+  var loss=0;
+  for(var i=0;i<rows.length;i++){
+    const r=rows[i]; const closed = String(r[10]||'');
+    if(!closed.startsWith(today)) continue;
+    const R = +r[6]||0;
+    if(R<0){
+      const riskUSD = ACCOUNT_SIZE_USD * (RISK_PER_TRADE_PCT/100);
+      loss += Math.abs(R) * riskUSD;
+    }
+  }
+  return loss;
+}
+
+/* =================== Signal Engine =================== */
+function ensureSheetsCore(){
+  U.getOrCreate('📡 ТЕСТ', ['Эндпоинт','Статус','Комментарий','Время (MSK)']);
+  U.getOrCreate('📈 ДЕРИВАТИВЫ', ['Время (MSK)','Символ','Цена','Источник','UTC','MSK ISO','Freshness']);
+  U.getOrCreate('📊 АКТИВНЫЕ СИГНАЛЫ', [
+    'ID','Символ','Сторона','Entry','SL',
+    'TP1','TP2','TP3','TP4',
+    'Alloc1','Alloc2','Alloc3','Alloc4',
+    'Left%','AvgExit','R(cur)','Горизонт','TTL(min)','Источник','Причина',
+    'Создано (MSK)','Freshness'
+  ]);
+  U.getOrCreate('📦 АРХИВ СИГНАЛОВ', [
+    'ID','Символ','Сторона','Entry','ExitAvg','Δ%','R','Итог','Длительность (мин)','Открыто (MSK)','Закрыто (MSK)','Комментарий'
+  ]);
+  ensureModelSheet();
+  ensureEventsSheet();
+}
+function appendDerivativesLog(pack){
+  const sh = U.getOrCreate('📈 ДЕРИВАТИВЫ', ['Время (MSK)','Символ','Цена','Источник','UTC','MSK ISO','Freshness']);
+  const now = U.nowStr(); const freshness = pack._source||'LIVE';
+  const symbols = getSymbolsList();
+  const rows=[];
+  for(var i=0;i<symbols.length;i++){
+    const s = symbols[i];
+    const r = pack.data[s];
+    if(r) rows.push([now, s, r.price ?? '', r.source||'N/A', r.timestampUtc||'', r.timestampMskIso||'', freshness]);
+    else  rows.push([now, s, '', 'NO_DATA', '', '', freshness]);
+  }
+  if(rows.length) sh.getRange(sh.getLastRow()+1,1,rows.length,rows[0].length).setValues(rows);
+}
+function computeFeatures(sym, snap){
+  const walls = Analytics.wallsAndObi(sym, snap.price);
+  const atr   = Analytics.atr(sym);
+  const cvd   = Analytics.cvd(sym);
+  const fRate = Analytics.funding(sym);
+  const oiObj = Analytics.openInterest(sym);
+  const oi = oiObj.oi, delta = oiObj.delta;
+  const projDist = (function(){
+    const up = isFinite(walls.ceil)? (walls.ceil - snap.price) : 0;
+    const dn = isFinite(walls.floor)? (snap.price - walls.floor) : 0;
+    const d = Math.max(up, dn);
+    return d>0? (d/snap.price) : 0;
+  })();
+  const btcAdj = Analytics.btcAdj(sym);
+  return {
+    OBI: walls.OBI||0,
+    floor: walls.floor, ceil: walls.ceil,
+    atr: atr, cvd: cvd || 0,
+    funding: fRate || 0,
+    oi: oi, dOI: delta || 0,
+    proj: projDist,
+    btcAdj: btcAdj
+  };
+}
+function decideHorizon(px, floor, ceil){
+  return Analytics.horizonByProj(px, floor, ceil);
+}
+function decideSignal(prob, longMin, shortMax){
+  if(prob >= longMin) return 'LONG';
+  if(prob <= shortMax) return 'SHORT';
+  return 'NEUTRAL';
+}
+function calcSL_TPs(side, px, atr, floor, ceil, eventSLmult){
+  const atrSL = Math.max(atr, px * (+readSettingMap()['ATR_MIN_RATIO'] || ATR_MIN_RATIO));
+  const buf   = px * (+readSettingMap()['WALL_BUF_RATIO'] || WALL_BUF_RATIO);
+  var SL=null;
+  if(side==='LONG'){
+    SL = isFinite(floor)? (floor - buf) : (px - atrSL);
+  }else{
+    SL = isFinite(ceil)? (ceil + buf)  : (px + atrSL);
+  }
+  if(eventSLmult && isFinite(eventSLmult) && eventSLmult>0.1) {
+    if(side==='LONG') SL = px - (px - SL)*eventSLmult;
+    else              SL = px + (SL - px)*eventSLmult;
+  }
+  const R = Math.abs(px - SL);
+  const TPs = TP_R.map(function(r){ return side==='LONG'? (px + r*R) : (px - r*R); });
+  return { SL:SL, TPs:TPs, R:R };
+}
+function canOpenMoreForSymbol(sym){
+  const sh = U.getOrCreate('📊 АКТИВНЫЕ СИГНАЛЫ', []);
+  const rows = sh.getDataRange().getValues().slice(1);
+  const openForSym = rows.filter(function(r){ return String(r[1])===sym && String(r[20]||'').length>0; }).length;
+  return openForSym===0;
+}
+function openTrade(sym, side, snap, feats, prob, horizon, ttlMin, sl, tps, R, reason){
+  const sh = U.getOrCreate('📊 АКТИВНЫЕ СИГНАЛЫ', []);
+  const id = U.id(sym);
+  const alloc = TP_ALLOCATION.slice();
+  const row = [
+    id, sym, side, snap.price, sl,
+    tps[0], tps[1], tps[2], tps[3],
+    alloc[0], alloc[1], alloc[2], alloc[3],
+    1.00, 0.0, 0.0, horizon, ttlMin, snap.src, reason,
+    U.nowStr(), snap.freshness
+  ];
+  sh.getRange(sh.getLastRow()+1,1,1,row.length).setValues([row]);
+  return id;
+}
+function processActive(){
+  const sh = U.getOrCreate('📊 АКТИВНЫЕ СИГНАЛЫ', []);
+  const rng = sh.getDataRange(); const vals = rng.getValues();
+  if(vals.length<=1) return;
+
+  const header = vals[0]; const rows = vals.slice(1);
+  function idx(name){ return header.indexOf(name); }
+
+  const iID=idx('ID'), iSym=idx('Символ'), iSide=idx('Сторона'), iEntry=idx('Entry'), iSL=idx('SL'),
+        iTP1=idx('TP1'),iTP2=idx('TP2'),iTP3=idx('TP3'),iTP4=idx('TP4'),
+        iA1=idx('Alloc1'),iA2=idx('Alloc2'),iA3=idx('Alloc3'),iA4=idx('Alloc4'),
+        iLeft=idx('Left%'),iAvg=idx('AvgExit'),iR=idx('R(cur)'),iHor=idx('Горизонт'),iTTL=idx('TTL(min)'),
+        iCreated=idx('Создано (MSK)');
+
+  const archive = U.getOrCreate('📦 АРХИВ СИГНАЛОВ', []);
+
+  const toDelete=[];
+
+  for(var r=0; r<rows.length; r++){
+    const row = rows[r];
+    const id   = String(row[iID]);
+    const sym  = String(row[iSym]);
+    const side = String(row[iSide]);
+    const entry= +row[iEntry];
+    const SL   = +row[iSL];
+    const TP1  = +row[iTP1], TP2=+row[iTP2], TP3=+row[iTP3], TP4=+row[iTP4];
+    var a1=+row[iA1], a2=+row[iA2], a3=+row[iA3], a4=+row[iA4];
+    var left=+row[iLeft], avg=+row[iAvg], Rcur=+row[iR];
+    const ttlMin=+row[iTTL]||TTL_SWING_MIN
