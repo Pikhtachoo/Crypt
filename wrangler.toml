@@ -1,0 +1,19 @@
+name = "quantum-trader-pro"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[env.production]
+name = "quantum-trader-pro"
+
+[env.staging]
+name = "quantum-trader-pro-staging"
+
+# Переменные окружения
+[vars]
+WORKER_KEY = "MySuperSecretKey123!@#"
+TZ = "Europe/Moscow"
+
+# Настройки для разработки
+[dev]
+port = 8787
+local = true
